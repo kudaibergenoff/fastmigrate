@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fastmigrate"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["SQLAlchemy>=2.0,<3"]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-cov>=5"]
+postgres = ["psycopg[binary]>=3.1"]
+
+[tool.setuptools.packages.find]
+include = ["fastmigrate*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "postgres: integration tests requiring an explicitly configured PostgreSQL test database",
+]
