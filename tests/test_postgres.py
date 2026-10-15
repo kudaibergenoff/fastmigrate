@@ -1,6 +1,9 @@
+from uuid import uuid4
+
 import pytest
-from sqlalchemy import inspect, select, text
+from sqlalchemy import Column, ForeignKey, Integer, MetaData, Table, inspect, select, text
 from sqlalchemy.exc import DBAPIError, IntegrityError
+from sqlalchemy.schema import CreateSchema, DropSchema
 
 from fastmigrate import MigrationRunner
 from fastmigrate.schema import _connection
@@ -26,7 +29,7 @@ def write_migration(runner, name, table, *, fail_up=False, fail_down=False):
         "    def up(self):\n"
         f"        Schema.create({table!r}, lambda t: (\n"
         "            t.id(), t.string('email').unique(),\n"
-        "            t.string('status').index(), t.boolean('active').default(True)\n"
+        "            t.string('status').default('new').index(), t.boolean('active').default(True)\n"
         "        ))\n"
         f"{up_failure}"
         "    def down(self):\n"
@@ -130,3 +133,59 @@ def test_missing_file_prevents_partial_rollback(runner):
     assert inspect(runner.engine).has_table("first")
     assert inspect(runner.engine).has_table("second")
     assert len(history(runner)) == 2
+
+
+def test_step_across_batches_and_reset(runner):
+    write_migration(runner, "001_first.py", "first")
+    runner.migrate()
+    write_migration(runner, "002_second.py", "second")
+    write_migration(runner, "003_third.py", "third")
+    runner.migrate()
+    assert runner.rollback(step=2) == ["003_third.py", "002_second.py"]
+    assert history(runner) == [("001_first.py", 1)]
+    assert runner.reset() == ["001_first.py"]
+    assert history(runner) == []
+
+
+@pytest.mark.parametrize("command", ["refresh", "fresh"])
+def test_rebuild_failure_restores_original_data_and_history(runner, command):
+    write_migration(runner, "001_users.py", "users")
+    runner.migrate()
+    with runner.engine.begin() as conn:
+        conn.execute(text("INSERT INTO users (email) VALUES ('preserved')"))
+    write_migration(runner, "002_bad.py", "partial", fail_up=True)
+    with pytest.raises(RuntimeError, match="up failed"):
+        getattr(runner, command)()
+    with runner.engine.connect() as conn:
+        assert conn.execute(text("SELECT email FROM users")).scalar_one() == "preserved"
+    assert not inspect(runner.engine).has_table("partial")
+    assert history(runner) == [("001_users.py", 1)]
+
+
+@pytest.mark.parametrize("external_reference", [False, True])
+def test_fresh_is_scoped_and_does_not_cascade_into_other_schemas(runner, external_reference):
+    write_migration(runner, "001_users.py", "users")
+    runner.migrate()
+    other = "fastmigrate_other_" + uuid4().hex
+    with runner.engine.begin() as conn:
+        conn.execute(CreateSchema(other))
+    try:
+        with runner.engine.begin() as conn:
+            metadata = MetaData()
+            users = Table("users", metadata, autoload_with=conn, schema=inspect(conn).default_schema_name)
+            column = Column("user_id", Integer, ForeignKey(users.c.id)) if external_reference else Column("id", Integer)
+            Table("keep", metadata, column, schema=other).create(conn)
+            Table('unmanaged"table', MetaData(), Column("id", Integer)).create(conn)
+        if external_reference:
+            with pytest.raises(DBAPIError):
+                runner.fresh()
+            assert inspect(runner.engine).has_table('unmanaged"table')
+        else:
+            assert runner.fresh() == ["001_users.py"]
+            assert not inspect(runner.engine).has_table('unmanaged"table')
+        assert inspect(runner.engine).has_table("users")
+        assert inspect(runner.engine).has_table("keep", schema=other)
+        assert history(runner) == [("001_users.py", 1)]
+    finally:
+        with runner.engine.begin() as conn:
+            conn.execute(DropSchema(other, cascade=True))

@@ -3,7 +3,8 @@ import hashlib
 import importlib.util
 import re
 import sys
-from sqlalchemy import MetaData, Table, Column, String, Integer, select, func, insert, delete
+from sqlalchemy import MetaData, Table, Column, String, Integer, select, func, insert, delete, inspect
+from .compiler import DropTables
 from .migration import Migration
 from .schema import _connection
 
@@ -51,50 +52,104 @@ class MigrationRunner:
 
     def migrate(self):
         files = self._files()
-        applied = []
-        # One transaction for this run: schema + history commit together.
         with self.engine.begin() as conn:
-            self.history.create(conn, checkfirst=True)
-            existing = set(conn.execute(select(self.history.c.migration)).scalars())
-            batch = (conn.execute(select(func.max(self.history.c.batch))).scalar() or 0) + 1
-            token = _connection.set(conn)
-            try:
-                for path in files:
-                    if path.name in existing:
-                        continue
-                    migration = self._load(path)
-                    migration.up()
-                    conn.execute(insert(self.history).values(migration=path.name, batch=batch))
-                    applied.append(path.name)
-            finally:
-                _connection.reset(token)
+            return self._apply(conn, files)
+
+    def _apply(self, conn, files):
+        applied = []
+        self.history.create(conn, checkfirst=True)
+        existing = set(conn.execute(select(self.history.c.migration)).scalars())
+        batch = (conn.execute(select(func.max(self.history.c.batch))).scalar() or 0) + 1
+        token = _connection.set(conn)
+        try:
+            for path in files:
+                if path.name in existing:
+                    continue
+                self._load(path).up()
+                conn.execute(insert(self.history).values(migration=path.name, batch=batch))
+                applied.append(path.name)
+        finally:
+            _connection.reset(token)
         return applied
 
-    def rollback(self):
-        rolled_back = []
+    def _history_names(self):
+        return select(self.history.c.migration).order_by(
+            self.history.c.batch.desc(), self.history.c.migration.desc()
+        )
+
+    def _revert(self, conn, names, files):
+        paths = {p.name: p for p in files}
+        missing = set(names) - paths.keys()
+        if missing:
+            raise FileNotFoundError(f"Missing migration files: {sorted(missing)}")
+        token = _connection.set(conn)
+        try:
+            for name in names:
+                self._load(paths[name]).down()
+                conn.execute(delete(self.history).where(self.history.c.migration == name))
+        finally:
+            _connection.reset(token)
+        return names
+
+    def rollback(self, step=None):
+        """Reverse the last batch, or the last N migrations when step is set."""
+        if step is not None and (type(step) is not int or step <= 0):
+            raise ValueError("step must be a positive integer")
         with self.engine.begin() as conn:
             self.history.create(conn, checkfirst=True)
-            batch = conn.execute(select(func.max(self.history.c.batch))).scalar()
-            if batch is None:
-                return rolled_back
-            names = list(conn.execute(
-                select(self.history.c.migration)
-                .where(self.history.c.batch == batch)
-                .order_by(self.history.c.migration.desc())
-            ).scalars())
-            paths = {p.name: p for p in self._files()}
-            missing = set(names) - paths.keys()
-            if missing:
-                raise FileNotFoundError(f"Missing migration files: {sorted(missing)}")
-            token = _connection.set(conn)
-            try:
-                for name in names:
-                    self._load(paths[name]).down()
-                    conn.execute(delete(self.history).where(self.history.c.migration == name))
-                    rolled_back.append(name)
-            finally:
-                _connection.reset(token)
-        return rolled_back
+            query = self._history_names()
+            if step is None:
+                batch = conn.execute(select(func.max(self.history.c.batch))).scalar()
+                query = query.where(self.history.c.batch == batch)
+            else:
+                query = query.limit(step)
+            names = list(conn.execute(query).scalars())
+            if not names:
+                return []
+            return self._revert(conn, names, self._files())
+
+    def reset(self):
+        """Reverse every applied migration, most recent batch first."""
+        files = self._files()
+        with self.engine.begin() as conn:
+            self.history.create(conn, checkfirst=True)
+            names = list(conn.execute(self._history_names()).scalars())
+            return self._revert(conn, names, files)
+
+    def refresh(self):
+        """Reset and reapply in one transaction (transactional DDL on PostgreSQL)."""
+        files = self._files()
+        with self.engine.begin() as conn:
+            self.history.create(conn, checkfirst=True)
+            names = list(conn.execute(self._history_names()).scalars())
+            self._revert(conn, names, files)
+            return self._apply(conn, files)
+
+    def fresh(self):
+        """Drop ALL tables in the current schema, then apply migrations."""
+        files = self._files()
+        dialect = self.engine.dialect.name
+        if dialect not in {"postgresql", "sqlite"}:
+            raise NotImplementedError("fresh supports PostgreSQL and SQLite only")
+        with self.engine.begin() as conn:
+            if dialect == "postgresql":
+                schema = conn.execute(select(func.current_schema())).scalar_one()
+                if not schema or schema.startswith("pg_") or schema == "information_schema":
+                    raise ValueError("fresh requires a non-system current schema")
+                metadata = MetaData()
+                tables = [
+                    Table(name, metadata, schema=schema)
+                    for name in inspect(conn).get_table_names(schema=schema)
+                ]
+                if tables:
+                    # One DROP handles mutual dependencies within the selected set.
+                    # No CASCADE: external dependencies fail instead of being removed.
+                    conn.execute(DropTables(tables))
+            else:
+                metadata = MetaData()
+                metadata.reflect(conn)
+                metadata.drop_all(conn)
+            return self._apply(conn, files)
 
     def status(self):
         files = self._files()

@@ -23,21 +23,32 @@ ALTER TABLE, new history columns and advisory locks belong to later stages.
 
 ## Verification on 2026-10-15
 
-- Python 3.10 grammar parsing and bytecode compilation succeeded for all 12
-  project/test Python files (performed with Python 3.13).
-- `pyproject.toml` parsed successfully.
-- Five direct filename-pattern assertions passed.
-- Original and expanded pytest suites **have not executed**: neither pytest nor
-  SQLAlchemy is installed in the available Python environments. Installing from
-  an index is disabled (`PIP_NO_INDEX=1`); a connection to PyPI was also refused.
-- Creating `.venv` produced an interpreter, but pip bootstrap failed on temporary
-  directory permissions. It is not a ready-to-use test environment.
-- PostgreSQL integration tests **have not executed**: no test URL is configured,
-  and access to the Docker API returned `permission denied`.
-- The GitHub Actions workflow is prepared but has not been run in this session.
+After the user prepared the environment, `.venv` contains pytest, pytest-cov,
+SQLAlchemy and psycopg. Actual results with Python 3.13.7:
 
-These checks do not establish runtime correctness. Stage 1 acceptance remains
-pending until the original tests, new regressions and PostgreSQL suite pass.
+- Original suite (`tests/test_runner.py`): **3 passed**.
+- Complete collected suite: **31 passed, 6 skipped**.
+- Coverage: **99.39%** (163 of 164 statements); Blueprint and Schema: **100%**.
+- The six skipped cases are all PostgreSQL integration tests. No
+  `FASTMIGRATE_TEST_DATABASE_URL` is configured in the agent's process; Docker
+  API access is denied, and a connection to the test endpoint on port 55432
+  timed out. PostgreSQL acceptance is still pending a successful test report.
+- JUnit output from this run: `.tmp/stage1-results.xml` (ignored by Git).
+- Python 3.10 grammar parsing and compilation previously succeeded for all 12
+  project/test Python files; `pyproject.toml` and five filename-pattern checks
+  also passed.
+- The GitHub Actions workflow has not been run in this session.
+
+The first standard pytest invocation failed during fixture setup because this
+Windows sandbox cannot access directories created by pytest with private temp
+permissions. The successful runs used an invocation-local pytest plugin replacing
+only `tmp_path`: each test received a fresh UUID directory under `.tmp`, created
+with inherited workspace permissions. The built-in temp plugin and cache were
+disabled. No test assertions, migrations or application behavior were replaced.
+This workaround is not installed in the project or used by the normal CI suite.
+
+Stage 1's unit/regression verification is complete. Full acceptance still requires
+the six PostgreSQL integration tests to pass.
 
 ## Commands to finish acceptance in a prepared environment
 
@@ -56,3 +67,28 @@ python -m pytest -q --strict-markers --cov=fastmigrate --cov-report=term-missing
 
 Do not change the original failure test to transaction-per-migration expectations
 until that behavior is implemented as a separate runner milestone.
+
+## Follow-up: reproducible local acceptance
+
+Initially, dependencies were absent and no suitable SQLAlchemy/pytest wheels
+were found in the local pip HTTP cache. The user subsequently prepared `.venv`;
+the results above supersede that initial dependency blocker.
+
+Added `scripts/verify-stage1.ps1` and `compose.test.yaml` so acceptance can be run
+from a normal PowerShell terminal:
+
+```powershell
+.\scripts\verify-stage1.ps1 -StartPostgres
+```
+
+The script creates its own uniquely named Compose project and only removes that
+project's test container. PostgreSQL listens on loopback and stores data in tmpfs.
+An offline wheel directory can be supplied with `-Wheelhouse`; `-UnitOnly` is an
+explicit partial-verification mode. Failure to prepare dependencies or connect
+to Docker stops execution rather than reporting tests as passed.
+
+Verification of the helper: PowerShell parsing and `docker compose --file
+compose.test.yaml config --quiet` succeeded. Running the helper with
+`-StartPostgres` stopped at the Docker permission check, before creating a
+container. Original/regression tests have now passed; PostgreSQL acceptance
+remains pending.

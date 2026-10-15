@@ -34,4 +34,6 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - run: python -m pip install -e ".[postgres,test]"
+      - run: fastmigrate --help
+      - run: python manage.py --help
       - run: python -m pytest -q --strict-markers --cov=fastmigrate --cov-report=term-missing --cov-fail-under=80

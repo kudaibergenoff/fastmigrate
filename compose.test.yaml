@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: fastmigrate
+      POSTGRES_PASSWORD: fastmigrate_test
+      POSTGRES_DB: fastmigrate_test
+    ports:
+      - "127.0.0.1:${FASTMIGRATE_TEST_PORT:-55432}:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fastmigrate -d fastmigrate_test"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
