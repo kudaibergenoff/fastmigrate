@@ -1,6 +1,7 @@
 from contextvars import ContextVar
 from sqlalchemy import MetaData, Table, inspect
 from sqlalchemy.exc import NoSuchTableError
+from sqlalchemy.schema import AddConstraint
 from .blueprint import Blueprint
 from .compiler import TableOperation, alter_statements
 
@@ -20,7 +21,18 @@ class Schema:
         metadata = MetaData()
         blueprint = Blueprint(name, metadata)
         callback(blueprint)
+        blueprint.validate()
+        foreign_keys = sorted(blueprint.table.foreign_key_constraints, key=lambda fk: fk.name or "")
+        if conn.dialect.name == "postgresql":
+            # PostgreSQL needs referenced unique indexes to exist before a FK is
+            # installed, including self-references. Table.create emits indexes.
+            for foreign_key in foreign_keys:
+                foreign_key.use_alter = True
+                AddConstraint(foreign_key).compile(dialect=conn.dialect)
         blueprint.table.create(conn, checkfirst=False)
+        if conn.dialect.name == "postgresql":
+            for foreign_key in foreign_keys:
+                conn.execute(AddConstraint(foreign_key))
 
     @classmethod
     def table(cls, name, callback):
@@ -29,6 +41,7 @@ class Schema:
             raise NoSuchTableError(name)
         blueprint = Blueprint(name, MetaData(), alter=True)
         callback(blueprint)
+        blueprint.validate(inspect(conn).get_columns(name))
         for statement in alter_statements(blueprint, conn.dialect):
             conn.execute(statement)
 

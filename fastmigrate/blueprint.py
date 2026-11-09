@@ -5,7 +5,7 @@ import hashlib
 from sqlalchemy import (
     BigInteger, Boolean, CheckConstraint, Column, Date, DateTime, DefaultClause,
     Float, Index, Integer, JSON, LargeBinary, Numeric, SmallInteger, String,
-    Table, Text, UniqueConstraint, Uuid, false, func, true,
+    PrimaryKeyConstraint, Table, Text, UniqueConstraint, Uuid, false, func, true,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 
@@ -25,6 +25,7 @@ class ColumnDefinition:
         self._unique_constraint = None
         self._unsigned_constraint = None
         self._index = None
+        self._foreign_key = None
         self.is_change = False
         self.nullable_changed = False
         self.default_changed = False
@@ -93,17 +94,43 @@ class ColumnDefinition:
         self.is_change = True
         return self
 
+    def constrained(self, table, column="id", *, name=None, schema=None):
+        if self.blueprint is None:
+            raise ValueError("constrained() requires a Blueprint")
+        if self._foreign_key is not None:
+            raise ValueError("This column already has a foreign-key declaration")
+        self._foreign_key = self.blueprint.foreign(self.column.name, name)
+        self._foreign_key.references(column).on(table, schema=schema)
+        return self
+
+    def on_delete(self, action):
+        if self._foreign_key is None:
+            raise ValueError("Call constrained() before on_delete()")
+        self._foreign_key.on_delete(action)
+        return self
+
+    def on_update(self, action):
+        if self._foreign_key is None:
+            raise ValueError("Call constrained() before on_update()")
+        self._foreign_key.on_update(action)
+        return self
+
 class Blueprint:
     def __init__(self, name, metadata, *, alter=False):
         self.table = Table(name, metadata)
         self.alter = alter
         self.operations = []
         self._references = set()
+        self.foreign_keys = []
 
     def _add(self, name, type_, **kwargs):
         kwargs.setdefault("nullable", False)
         col = Column(name, type_, **kwargs)
         self.table.append_column(col, replace_existing=name in self._references)
+        for foreign_key in self.foreign_keys:
+            foreign_key.rebind_if_needed()
+        if col.primary_key and self.table.primary_key.name is None:
+            self.table.primary_key.name = object_name(self.table.name, [], "primary")
         self._references.discard(name)
         definition = ColumnDefinition(col, self)
         if self.alter:
@@ -184,10 +211,67 @@ class Blueprint:
                 self._references.add(name)
         return [self.table.c[name] for name in names]
 
-    def index(self, columns, name=None):
+    def index(self, columns, name=None, *, unique=False):
         cols = self._columns(columns)
-        name = name or object_name(self.table.name, [col.name for col in cols], "index")
-        return Index(name, *cols)
+        suffix = "unique_index" if unique else "index"
+        name = name or object_name(self.table.name, [col.name for col in cols], suffix)
+        return Index(name, *cols, unique=unique)
+
+    def unique_index(self, columns, name=None):
+        return self.index(columns, name, unique=True)
+
+    def primary(self, columns, name=None):
+        if len(self.table.primary_key.columns):
+            raise ValueError("A primary key is already defined")
+        cols = self._columns(columns)
+        name = name or object_name(self.table.name, [], "primary")
+        return PrimaryKeyConstraint(*cols, name=name)
+
+    def foreign(self, columns, name=None):
+        from .foreign import ForeignKeyDefinition
+        definition = ForeignKeyDefinition(self, columns, name)
+        self.foreign_keys.append(definition)
+        return definition
+
+    def validate(self, existing_columns=None):
+        nullable = {col.name: col.nullable for col in self.table.c}
+        final_columns = set(nullable)
+        if self.alter and existing_columns is not None:
+            nullable = {col["name"]: col["nullable"] for col in existing_columns}
+            final_columns = set(nullable)
+            for kind, value in self.operations:
+                if kind == "column" and (not value.is_change or value.nullable_changed):
+                    nullable[value.column.name] = value.column.nullable
+                    if not value.is_change:
+                        final_columns.add(value.column.name)
+                elif kind == "rename_column":
+                    old, new = value
+                    nullable[new] = nullable.pop(old, False)
+                    final_columns.discard(old)
+                    final_columns.add(new)
+                elif kind == "drop_column":
+                    nullable.pop(value[0], None)
+                    final_columns.discard(value[0])
+        elif self.alter:
+            for kind, value in self.operations:
+                if kind == "rename_column":
+                    old, new = value
+                    final_columns.discard(old)
+                    final_columns.add(new)
+                elif kind == "drop_column":
+                    final_columns.discard(value[0])
+        for item in [*self.table.constraints, *self.table.indexes]:
+            for column in item.columns:
+                if column.name not in final_columns:
+                    raise ValueError(
+                        f"Pending constraint/index {item.name!r} references missing or renamed "
+                        f"column {column.name!r}; use its final name"
+                    )
+        for definition in self.foreign_keys:
+            definition.validate(nullable)
+            if definition.target.name == self.table.name and definition.target.schema == self.table.schema:
+                if not set(definition.target_columns) <= final_columns:
+                    raise ValueError("A self-referencing foreign key must use final column names")
 
     def unique(self, columns, name=None):
         cols = self._columns(columns)
@@ -213,3 +297,11 @@ class Blueprint:
 
     def drop_unique(self, name):
         self.drop_constraint(name)
+
+    def drop_foreign(self, name):
+        if not isinstance(name, str):
+            name = object_name(self.table.name, list(name), "foreign")
+        self.drop_constraint(name)
+
+    def drop_primary(self, name=None):
+        self.drop_constraint(name or object_name(self.table.name, [], "primary"))

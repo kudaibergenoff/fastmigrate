@@ -142,7 +142,7 @@ Public methods: `Schema.create`, `Schema.table`, `Schema.drop`,
 | `timestamp(name, timezone=True)` | TIMESTAMP with timezone by default |
 | `json(name)` / `jsonb(name)` | JSON / JSONB |
 | `binary(name)` | BYTEA |
-| `foreign_id(name)` | BIGINT; foreign-key constraints are a subsequent milestone |
+| `foreign_id(name)` | BIGINT; chain `.constrained(table)` to add a foreign key |
 | `timestamps()` | created_at, updated_at with insert defaults |
 | `soft_deletes(name="deleted_at")` | nullable timestamp |
 
@@ -203,6 +203,62 @@ SQLite smoke tests support create/drop/rename, adding/dropping/renaming columns
 and indexes. Existing-column type changes, constraint changes and ALTER comments
 require PostgreSQL. JSONB uses SQLite JSON in smoke tests. Unsupported ALTER
 operations are rejected before any DDL in that callback is executed.
+
+## Foreign keys and primary keys
+
+```python
+Schema.create("orders", lambda table: (
+    table.id(),
+    table.foreign_id("user_id").constrained("users").on_delete("CASCADE"),
+    table.decimal("amount", 12, 2),
+    table.timestamps(),
+))
+```
+
+`constrained(table, column="id", name=None, schema=None)` uses an explicit target
+table; it does not guess English pluralization. Column modifiers can follow it:
+
+```python
+table.foreign_id("user_id").constrained("users") \
+    .on_delete("SET NULL").on_update("CASCADE").nullable()
+```
+
+Supported actions are `CASCADE`, `SET NULL`, `RESTRICT`, `NO ACTION` and
+`SET DEFAULT`. Actions are normalized and validated. `SET NULL` requires all
+local key columns to be nullable; this is checked before DDL, including when
+adding a key to existing columns or changing nullable in the same callback.
+
+Composite keys and indexes:
+
+```python
+table.integer("tenant_id")
+table.string("account_code")
+table.primary(["tenant_id", "account_code"], "accounts_primary")
+table.foreign(["tenant_id", "account_code"], "events_account_foreign") \
+    .references(["tenant_id", "code"]).on("accounts") \
+    .on_delete("CASCADE").on_update("CASCADE")
+table.unique_index(["tenant_id", "account_code"], "account_lookup")
+```
+
+Declare columns before composite primary keys. `id()` already declares a named
+primary key. Default names are `<table>_primary` and
+`<table>_<local_columns>_foreign`, with the same byte-limit hashing as indexes.
+After renaming a table, existing constraint names remain unchanged; use their
+actual names when dropping them.
+
+Within `Schema.table`, use `drop_foreign("constraint_name")`,
+`drop_foreign(["user_id"])` for a generated name, or
+`drop_primary("constraint_name")`. Constraint/index declarations refer to final
+column names. For a rename in the same callback, declare the key using the new
+name; referring to a renamed/dropped name is rejected before any DDL.
+
+PostgreSQL creates PK/UNIQUE constraints and indexes before foreign keys,
+including self-FKs targeting a unique index. Foreign-key targets are represented
+as SQLAlchemy column objects, so dots and quotes in identifiers are preserved
+instead of being treated as SQL. Foreign keys on new SQLite tables are supported
+for smoke tests; adding/removing SQLite constraints through ALTER is not.
+SQLite foreign-key enforcement must be explicitly enabled on the engine when
+testing behavior (our FK tests use `PRAGMA foreign_keys=ON`).
 
 ## Install and test
 
@@ -293,8 +349,8 @@ indexes, unique/CHECK constraints, CLI generation, migration history and rollbac
 
 **Limitations:** SQLite is for smoke tests; SQLite DDL rollback is not guaranteed.
 PostgreSQL supports transactional DDL, but the runner does not yet implement
-cross-process advisory locks. No foreign-key constraints or async runner,
-or production-safe concurrent migrations yet.
+cross-process advisory locks. No async runner or production-safe concurrent
+migrations yet.
 Migration filenames must be trusted Python code. Do not run untrusted migration files.
 
 ### Runner behavior

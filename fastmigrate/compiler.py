@@ -1,6 +1,7 @@
 """DDL constructs whose identifiers are quoted by the SQLAlchemy dialect."""
 
 from sqlalchemy.ext.compiler import compiles
+from sqlalchemy import ForeignKeyConstraint
 from sqlalchemy.schema import (
     AddConstraint, CreateColumn, CreateIndex, DDLElement, PrimaryKeyConstraint,
     SetColumnComment,
@@ -115,8 +116,11 @@ def alter_statements(blueprint, dialect):
                 statements.append(SetColumnComment(value.column))
         else:
             statements.append(TableOperation(table, kind, *value))
-    statements.extend(AddConstraint(c) for c in sorted(constraints, key=lambda c: c.name or ""))
+    statements.extend(AddConstraint(c) for c in sorted(constraints, key=lambda c: c.name or "")
+                      if not isinstance(c, ForeignKeyConstraint))
     statements.extend(CreateIndex(i) for i in sorted(table.indexes, key=lambda i: i.name))
+    statements.extend(AddConstraint(c) for c in sorted(constraints, key=lambda c: c.name or "")
+                      if isinstance(c, ForeignKeyConstraint))
     for statement in statements:
         statement.compile(dialect=dialect)
     return statements

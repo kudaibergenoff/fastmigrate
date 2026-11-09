@@ -8,6 +8,8 @@
 - Migration generation, last-N rollback, reset, refresh and fresh commands.
 - PostgreSQL column types, schema inspection/rename/drop and ALTER TABLE builder.
 - Named indexes and unique/CHECK constraints; numeric unsigned checks.
+- Single/composite foreign keys, named primary keys, unique composite indexes,
+  validated referential actions and constraint removal by name.
 - PostgreSQL integration tests and CI service configuration.
 
 ### Changed
@@ -26,5 +28,5 @@
 ### Pending
 
 - CLI and PostgreSQL runtime verification in the current environment.
-- Foreign keys, migration repository/history upgrade, advisory locking and
+- Migration repository/history upgrade, advisory locking and
   transaction-per-migration semantics before v0.2.0 release acceptance.
